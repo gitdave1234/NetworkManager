@@ -404,6 +404,11 @@ nm_dhcp_client_start_timeout (NMDhcpClient *self)
 
 	/* Set up a timeout on the transaction to kill it after the timeout */
 	g_assert (priv->timeout_id == 0);
+
+	/* If timeout is G_MAXINT32 skip a useless timeout */
+	if (priv->timeout == G_MAXINT32)
+		return;
+
 	priv->timeout_id = g_timeout_add_seconds (priv->timeout,
 	                                          transaction_timeout,
 	                                          self);
@@ -441,7 +446,10 @@ nm_dhcp_client_start_ip4 (NMDhcpClient *self,
 	g_return_val_if_fail (priv->ipv6 == FALSE, FALSE);
 	g_return_val_if_fail (priv->uuid != NULL, FALSE);
 
-	_LOGI ("activation: beginning transaction (timeout in %d seconds)", priv->timeout);
+	if (priv->timeout == G_MAXINT32)
+		_LOGI ("activation: beginning transaction (no timeout)");
+	else
+		_LOGI ("activation: beginning transaction (timeout in %d seconds)", priv->timeout);
 
 	if (dhcp_client_id)
 		tmp = nm_dhcp_utils_client_id_string_to_bytes (dhcp_client_id);

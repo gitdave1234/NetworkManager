@@ -3114,7 +3114,7 @@ nm_setting_ip_config_class_init (NMSettingIPConfigClass *setting_class)
 	g_object_class_install_property
 		(object_class, PROP_DHCP_TIMEOUT,
 		 g_param_spec_int (NM_SETTING_IP_CONFIG_DHCP_TIMEOUT, "", "",
-		                   0, G_MAXINT32, 0,
+		                   -1, G_MAXINT32, 0,
 		                   G_PARAM_READWRITE |
 		                   NM_SETTING_PARAM_FUZZY_IGNORE |
 		                   G_PARAM_STATIC_STRINGS));

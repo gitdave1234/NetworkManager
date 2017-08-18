@@ -5929,17 +5929,23 @@ dhcp4_get_timeout (NMDevice *self, NMSettingIP4Config *s_ip4)
 
 	timeout = nm_setting_ip_config_get_dhcp_timeout (NM_SETTING_IP_CONFIG (s_ip4));
 	if (timeout)
-		return timeout;
+		goto found;
 
 	value = nm_config_data_get_connection_default (NM_CONFIG_GET_DATA,
 	                                               "ipv4.dhcp-timeout",
 	                                               self);
 	timeout = _nm_utils_ascii_str_to_int64 (value, 10,
-	                                        0, G_MAXINT32, 0);
+	                                        -1, G_MAXINT32, 0);
 	if (timeout)
-		return timeout;
+		goto found;
 
 	return priv->dhcp_timeout;
+found:
+	/* -1 means no timeout: set it to MAXINT32 */
+	if (timeout == -1)
+		timeout = G_MAXINT32;
+
+	return timeout;
 }
 
 static NMActStageReturn
