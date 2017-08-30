@@ -65,7 +65,6 @@
 #include "nm-utils/c-list.h"
 #include "dns/nm-dns-manager.h"
 #include "nm-core-internal.h"
-#include "nm-default-route-manager.h"
 #include "systemd/nm-sd.h"
 #include "nm-lldp-listener.h"
 #include "nm-audit-manager.h"
@@ -349,14 +348,12 @@ typedef struct _NMDevicePrivate {
 	NMIP4Config *   ext_ip4_config; /* Stuff added outside NM */
 	NMIP4Config *   wwan_ip4_config; /* WWAN configuration */
 	GSList *        vpn4_configs;   /* VPNs which use this device */
-	struct {
-		bool v4_has;
-		bool v4_is_assumed;
-		bool v6_has;
-		bool v6_is_assumed;
-		NMPlatformIP4Route v4;
-		NMPlatformIP6Route v6;
-	} default_route;
+
+	const NMPObject *default_route4;
+	const NMPObject *default_route6;
+	const NMPObject *default_routegw4;
+	const NMPObject *default_routegw6;
+
 	bool v4_has_shadowed_routes;
 	const char *ip4_rp_filter;
 
@@ -1680,62 +1677,33 @@ out:
 	return nm_utils_ip_route_metric_normalize (addr_family, route_metric);
 }
 
-static void
-_update_default_route (NMDevice *self, int addr_family, gboolean has, gboolean is_assumed)
+const NMPObject *
+nm_device_get_best_default_route (NMDevice *self,
+                                  int addr_family)
 {
 	NMDevicePrivate *priv = NM_DEVICE_GET_PRIVATE (self);
-	bool *p_has, *p_is_assumed;
 
-	nm_assert (NM_IN_SET (addr_family, 0, AF_INET, AF_INET6));
-
-	if (addr_family == AF_INET) {
-		p_has = &priv->default_route.v4_has;
-		p_is_assumed = &priv->default_route.v4_is_assumed;
-	} else {
-		p_has = &priv->default_route.v6_has;
-		p_is_assumed = &priv->default_route.v6_is_assumed;
+	/* Prefer the best default-route we have in ipx_config.
+	 *
+	 * Otherwise, use priv->default_routeX. Usually, we would
+	 * expect that if ipx_config has no default route, then
+	 * also priv->default_routeX is unset. This is just to cover
+	 * I case I cannot immagine now. */
+	switch (addr_family) {
+	case AF_INET:
+		return    (priv->ip4_config ? nm_ip4_config_best_default_route_get (priv->ip4_config) : NULL)
+		       ?: priv->default_route4;
+	case AF_INET6:
+		return    (priv->ip6_config ? nm_ip6_config_best_default_route_get (priv->ip6_config) : NULL)
+		       ?: priv->default_route6;
+	case AF_UNSPEC:
+		return    (priv->ip4_config ? nm_ip4_config_best_default_route_get (priv->ip4_config) : NULL)
+		       ?: priv->default_route4
+		       ?: (priv->ip6_config ? nm_ip6_config_best_default_route_get (priv->ip6_config) : NULL)
+		       ?: priv->default_route6;
+	default:
+		g_return_val_if_reached (NULL);
 	}
-
-	if (*p_has == has && *p_is_assumed == is_assumed)
-		return;
-
-	*p_has = has;
-	*p_is_assumed = is_assumed;
-
-	if (addr_family == AF_INET)
-		nm_default_route_manager_ip4_update_default_route (nm_netns_get_default_route_manager (priv->netns), self);
-	else
-		nm_default_route_manager_ip6_update_default_route (nm_netns_get_default_route_manager (priv->netns), self);
-}
-
-const NMPlatformIP4Route *
-nm_device_get_ip4_default_route (NMDevice *self, gboolean *out_is_assumed)
-{
-	NMDevicePrivate *priv;
-
-	g_return_val_if_fail (NM_IS_DEVICE (self), NULL);
-
-	priv = NM_DEVICE_GET_PRIVATE (self);
-
-	if (out_is_assumed)
-		*out_is_assumed = priv->default_route.v4_is_assumed;
-
-	return priv->default_route.v4_has ? &priv->default_route.v4 : NULL;
-}
-
-const NMPlatformIP6Route *
-nm_device_get_ip6_default_route (NMDevice *self, gboolean *out_is_assumed)
-{
-	NMDevicePrivate *priv;
-
-	g_return_val_if_fail (NM_IS_DEVICE (self), NULL);
-
-	priv = NM_DEVICE_GET_PRIVATE (self);
-
-	if (out_is_assumed)
-		*out_is_assumed = priv->default_route.v6_is_assumed;
-
-	return priv->default_route.v6_has ? &priv->default_route.v6 : NULL;
 }
 
 const char *
@@ -1852,7 +1820,7 @@ update_connectivity_state (NMDevice *self, NMConnectivityState state)
 	/* If the connectivity check is disabled, make an optimistic guess. */
 	if (state == NM_CONNECTIVITY_UNKNOWN) {
 		if (priv->state == NM_DEVICE_STATE_ACTIVATED) {
-			if (priv->default_route.v4_has || priv->default_route.v6_has)
+			if (nm_device_get_best_default_route (self, AF_UNSPEC))
 				state = NM_CONNECTIVITY_FULL;
 			else
 				state = NM_CONNECTIVITY_LIMITED;
@@ -1872,12 +1840,12 @@ update_connectivity_state (NMDevice *self, NMConnectivityState state)
 
 		if (   priv->state == NM_DEVICE_STATE_ACTIVATED
 		    && !nm_device_sys_iface_state_is_external (self)) {
-			if (   priv->default_route.v4_has
+			if (   nm_device_get_best_default_route (self, AF_INET)
 			    && !ip4_config_merge_and_apply (self, NULL, TRUE))
-				_LOGW (LOGD_IP4, "Failed to update IPv4 default route metric");
-			if (   priv->default_route.v6_has
+				_LOGW (LOGD_IP4, "Failed to update IPv4 route metric");
+			if (   nm_device_get_best_default_route (self, AF_INET6)
 			    && !ip6_config_merge_and_apply (self, TRUE))
-				_LOGW (LOGD_IP6, "Failed to update IPv6 default route metric");
+				_LOGW (LOGD_IP6, "Failed to update IPv6 route metric");
 		}
 	}
 }
@@ -1991,7 +1959,7 @@ concheck_periodic_update (NMDevice *self)
 	gboolean check_enable;
 
 	check_enable =    (priv->state == NM_DEVICE_STATE_ACTIVATED)
-	               && (priv->default_route.v4_has || priv->default_route.v6_has);
+	               && nm_device_get_best_default_route (self, AF_UNSPEC);
 
 	if (check_enable && !priv->concheck_periodic_id) {
 		/* We just gained a default route. Enable periodic checking. */
@@ -2853,7 +2821,7 @@ ip4_rp_filter_update (NMDevice *self)
 	const char *ip4_rp_filter;
 
 	if (   priv->v4_has_shadowed_routes
-	    || priv->default_route.v4_has) {
+	    || nm_device_get_best_default_route (self, AF_INET)) {
 		if (nm_device_ipv4_sysctl_get_uint32 (self, "rp_filter", 0) != 1) {
 			/* Don't touch the rp_filter if it's not strict. */
 			return;
@@ -3899,15 +3867,6 @@ nm_device_removed (NMDevice *self, gboolean unconfigure_ip_config)
 	if (!unconfigure_ip_config)
 		return;
 
-	/* Clean up IP configs; this does not actually deconfigure the
-	 * interface, it just clears the configuration to which policy
-	 * is reacting via NM_DEVICE_IP4_CONFIG_CHANGED/NM_DEVICE_IP6_CONFIG_CHANGED
-	 * signal. As NMPolicy registered the NMIPxConfig instances in NMDnsManager,
-	 * these would be leaked otherwise. */
-	_update_default_route (self, AF_INET,  priv->default_route.v4_has, TRUE);
-	_update_default_route (self, AF_INET6, priv->default_route.v6_has, TRUE);
-	_update_default_route (self, AF_INET,  FALSE, TRUE);
-	_update_default_route (self, AF_INET6, FALSE, TRUE);
 	nm_device_set_ip4_config (self, NULL, 0, FALSE);
 	nm_device_set_ip6_config (self, NULL, FALSE);
 }
@@ -5505,49 +5464,6 @@ ipv4ll_start (NMDevice *self)
 
 /*****************************************************************************/
 
-static gboolean
-_device_get_default_route_from_platform (NMDevice *self, int addr_family, NMPlatformIPRoute *out_route)
-{
-	int ifindex = nm_device_get_ip_ifindex (self);
-	const NMDedupMultiHeadEntry *pl_head_entry;
-	NMDedupMultiIter iter;
-	const NMPObject *plobj = NULL;
-	const NMPlatformIPRoute *route = NULL;
-	guint32 route_metric = G_MAXUINT32;
-
-	pl_head_entry = nm_platform_lookup_route_default (nm_device_get_platform (self),
-	                                                  addr_family == AF_INET
-	                                                    ? NMP_OBJECT_TYPE_IP4_ROUTE
-	                                                    : NMP_OBJECT_TYPE_IP6_ROUTE);
-	nmp_cache_iter_for_each (&iter, pl_head_entry, &plobj) {
-		guint32 m;
-		const NMPlatformIPRoute *r = NMP_OBJECT_CAST_IP_ROUTE (plobj);
-
-		if (   r->ifindex != ifindex
-		    || r->rt_source == NM_IP_CONFIG_SOURCE_RTPROT_KERNEL
-		    || r->table_coerced)
-			continue;
-
-		/* if there are several default routes, find the one with the best metric */
-		m = nm_utils_ip_route_metric_normalize (addr_family, r->metric);
-		if (!route || m < route_metric) {
-			route = NMP_OBJECT_CAST_IP_ROUTE (plobj);
-			route_metric = m;
-		}
-	}
-
-	if (route) {
-		if (addr_family == AF_INET)
-			*((NMPlatformIP4Route *) out_route) = *((NMPlatformIP4Route *) route);
-		else
-			*((NMPlatformIP6Route *) out_route) = *((NMPlatformIP6Route *) route);
-		return TRUE;
-	}
-	return FALSE;
-}
-
-/*****************************************************************************/
-
 static void
 ensure_con_ip4_config (NMDevice *self)
 {
@@ -5637,14 +5553,14 @@ ip4_config_merge_and_apply (NMDevice *self,
 	NMConnection *connection;
 	gboolean success;
 	NMIP4Config *composite;
-	gboolean has_direct_route;
 	const guint32 default_route_metric = nm_device_get_ip4_route_metric (self);
 	guint32 gateway;
 	gboolean connection_has_default_route, connection_is_never_default;
 	gboolean ignore_auto_routes = FALSE;
 	gboolean ignore_auto_dns = FALSE;
-	gboolean auto_method = FALSE;
 	GSList *iter;
+	NMPlatformIP4Route default_route;
+	gboolean default_route_remove_all = FALSE;
 
 	/* Merge all the configs into the composite config */
 	if (config) {
@@ -5660,10 +5576,6 @@ ip4_config_merge_and_apply (NMDevice *self,
 		if (s_ip4) {
 			ignore_auto_routes = nm_setting_ip_config_get_ignore_auto_routes (s_ip4);
 			ignore_auto_dns = nm_setting_ip_config_get_ignore_auto_dns (s_ip4);
-
-			if (nm_streq0 (nm_setting_ip_config_get_method (s_ip4),
-			               NM_SETTING_IP4_CONFIG_METHOD_AUTO))
-				auto_method = TRUE;
 		}
 	}
 
@@ -5707,39 +5619,16 @@ ip4_config_merge_and_apply (NMDevice *self,
 	if (priv->con_ip4_config)
 		nm_ip4_config_merge (composite, priv->con_ip4_config, NM_IP_CONFIG_MERGE_DEFAULT);
 
-	/* Add the default route.
-	 *
-	 * We keep track of the default route of a device in a private field.
-	 * NMDevice needs to know the default route at this point, because the gateway
-	 * might require a direct route (see below).
-	 *
-	 * But also, we don't want to add the default route to priv->ip4_config,
-	 * because the default route from the setting might not be the same that
-	 * NMDefaultRouteManager eventually configures (because the it might
-	 * tweak the effective metric).
-	 */
-
-	/* unless we come to a different conclusion below, we have no default route and
-	 * the route is assumed. */
-	priv->default_route.v4_has = FALSE;
-	priv->default_route.v4_is_assumed = TRUE;
+	/* Add the default route... */
 
 	if (!commit) {
 		/* during a non-commit event, we always pickup whatever is configured. */
 		goto END_ADD_DEFAULT_ROUTE;
 	}
 
-	/* a generated-assumed connection detects the default route from the platform,
-	 * but if the IP method is automatic we need to update the default route to
-	 * maintain connectivity.
-	 */
-	if (nm_device_sys_iface_state_is_external (self) && !auto_method)
+	/* for external connections, we always pickup whatever is configured. */
+	if (nm_device_sys_iface_state_is_external (self))
 		goto END_ADD_DEFAULT_ROUTE;
-
-	/* At this point, we treat assumed and non-assumed connections alike.
-	 * For assumed connections we do that because we still manage RA and DHCP
-	 * leases for them, so we must extend/update the default route on commits.
-	 */
 
 	connection_has_default_route
 	    = nm_utils_connection_has_default_route (connection, AF_INET, &connection_is_never_default);
@@ -5752,9 +5641,9 @@ ip4_config_merge_and_apply (NMDevice *self,
 		goto END_ADD_DEFAULT_ROUTE;
 	}
 
-	/* we are about to commit (for a non-assumed connection). Enforce whatever we have
-	 * configured. */
-	priv->default_route.v4_is_assumed = FALSE;
+	default_route_remove_all = TRUE;
+	nm_clear_nmp_object (&priv->default_route4);
+	nm_clear_nmp_object (&priv->default_routegw4);
 
 	if (!connection_has_default_route)
 		goto END_ADD_DEFAULT_ROUTE;
@@ -5769,37 +5658,29 @@ ip4_config_merge_and_apply (NMDevice *self,
 	    && nm_device_get_device_type (self) != NM_DEVICE_TYPE_MODEM)
 		goto END_ADD_DEFAULT_ROUTE;
 
-	has_direct_route = (   gateway == 0
-	                    || nm_ip4_config_destination_is_direct (composite, gateway, 32)
-	                    || nm_ip4_config_get_direct_route_for_host (composite, gateway));
+	default_route_remove_all = FALSE;
+	memset (&default_route, 0, sizeof (default_route));
+	default_route.rt_source = NM_IP_CONFIG_SOURCE_USER;
+	default_route.gateway = gateway;
+	default_route.metric = route_metric_with_penalty (self, default_route_metric);
+	default_route.mss = nm_ip4_config_get_mss (composite);
+	nm_clear_nmp_object (&priv->default_route4);
+	nm_ip4_config_add_route (composite, &default_route, &priv->default_route4);
 
-	priv->default_route.v4_has = TRUE;
-	memset (&priv->default_route.v4, 0, sizeof (priv->default_route.v4));
-	priv->default_route.v4.rt_source = NM_IP_CONFIG_SOURCE_USER;
-	priv->default_route.v4.gateway = gateway;
-	priv->default_route.v4.metric = route_metric_with_penalty (self, default_route_metric);
-	priv->default_route.v4.mss = nm_ip4_config_get_mss (composite);
-
-	if (!has_direct_route) {
-		NMPlatformIP4Route r = priv->default_route.v4;
-
+	if (!(   gateway == 0
+	      || nm_ip4_config_destination_is_direct (composite, gateway, 32)
+	      || nm_ip4_config_get_direct_route_for_host (composite, gateway))) {
 		/* add a direct route to the gateway */
-		r.network = gateway;
-		r.plen = 32;
-		r.gateway = 0;
-		nm_ip4_config_add_route (composite, &r, NULL);
+		default_route.network = gateway;
+		default_route.plen = 32;
+		default_route.gateway = 0;
+		nm_clear_nmp_object (&priv->default_routegw4);
+		nm_ip4_config_add_route (composite, &default_route, &priv->default_routegw4);
 	}
 
 END_ADD_DEFAULT_ROUTE:
-
-	if (priv->default_route.v4_is_assumed) {
-		/* If above does not explicitly assign a default route, we always pick up the
-		 * default route based on what is currently configured.
-		 * That means that even managed connections with never-default, can
-		 * get a default route (if configured externally).
-		 */
-		priv->default_route.v4_has = _device_get_default_route_from_platform (self, AF_INET, (NMPlatformIPRoute *) &priv->default_route.v4);
-	}
+	if (default_route_remove_all)
+		nm_ip4_config_default_routes_remove_all (composite);
 
 	if (commit) {
 		if (NM_DEVICE_GET_CLASS (self)->ip4_config_pre_commit)
@@ -6358,14 +6239,14 @@ ip6_config_merge_and_apply (NMDevice *self,
 	NMConnection *connection;
 	gboolean success;
 	NMIP6Config *composite;
-	gboolean has_direct_route;
 	const struct in6_addr *gateway;
 	gboolean connection_has_default_route, connection_is_never_default;
 	gboolean ignore_auto_routes = FALSE;
 	gboolean ignore_auto_dns = FALSE;
-	gboolean auto_method = FALSE;
 	const char *token = NULL;
 	GSList *iter;
+	NMPlatformIP6Route default_route;
+	gboolean default_route_remove_all = FALSE;
 
 	/* Apply ignore-auto-routes and ignore-auto-dns settings */
 	connection = nm_device_get_applied_connection (self);
@@ -6380,11 +6261,6 @@ ip6_config_merge_and_apply (NMDevice *self,
 
 			if (nm_setting_ip6_config_get_addr_gen_mode (ip6) == NM_SETTING_IP6_CONFIG_ADDR_GEN_MODE_EUI64)
 				token = nm_setting_ip6_config_get_token (ip6);
-
-			if (NM_IN_STRSET (nm_setting_ip_config_get_method (s_ip6),
-			                  NM_SETTING_IP6_CONFIG_METHOD_AUTO,
-			                  NM_SETTING_IP6_CONFIG_METHOD_DHCP))
-				auto_method = TRUE;
 		}
 	}
 
@@ -6442,39 +6318,16 @@ ip6_config_merge_and_apply (NMDevice *self,
 	if (priv->con_ip6_config)
 		nm_ip6_config_merge (composite, priv->con_ip6_config, NM_IP_CONFIG_MERGE_DEFAULT);
 
-	/* Add the default route.
-	 *
-	 * We keep track of the default route of a device in a private field.
-	 * NMDevice needs to know the default route at this point, because the gateway
-	 * might require a direct route (see below).
-	 *
-	 * But also, we don't want to add the default route to priv->ip6_config,
-	 * because the default route from the setting might not be the same that
-	 * NMDefaultRouteManager eventually configures (because the it might
-	 * tweak the effective metric).
-	 */
-
-	/* unless we come to a different conclusion below, we have no default route and
-	 * the route is assumed. */
-	priv->default_route.v6_has = FALSE;
-	priv->default_route.v6_is_assumed = TRUE;
+	/* Add the default route... */
 
 	if (!commit) {
 		/* during a non-commit event, we always pickup whatever is configured. */
 		goto END_ADD_DEFAULT_ROUTE;
 	}
 
-	/* a generated-assumed connection detects the default route from the platform,
-	 * but if the IP method is automatic we need to update the default route to
-	 * maintain connectivity.
-	 */
-	if (nm_device_sys_iface_state_is_external (self) && !auto_method)
+	/* for external connections, we always pickup whatever is configured. */
+	if (nm_device_sys_iface_state_is_external (self))
 		goto END_ADD_DEFAULT_ROUTE;
-
-	/* At this point, we treat assumed and non-assumed connections alike.
-	 * For assumed connections we do that because we still manage RA and DHCP
-	 * leases for them, so we must extend/update the default route on commits.
-	 */
 
 	connection_has_default_route
 	    = nm_utils_connection_has_default_route (connection, AF_INET6, &connection_is_never_default);
@@ -6487,9 +6340,9 @@ ip6_config_merge_and_apply (NMDevice *self,
 		goto END_ADD_DEFAULT_ROUTE;
 	}
 
-	/* we are about to commit (for a non-assumed connection). Enforce whatever we have
-	 * configured. */
-	priv->default_route.v6_is_assumed = FALSE;
+	default_route_remove_all = TRUE;
+	nm_clear_nmp_object (&priv->default_route6);
+	nm_clear_nmp_object (&priv->default_routegw6);
 
 	if (!connection_has_default_route)
 		goto END_ADD_DEFAULT_ROUTE;
@@ -6503,39 +6356,28 @@ ip6_config_merge_and_apply (NMDevice *self,
 	if (!gateway)
 		goto END_ADD_DEFAULT_ROUTE;
 
+	default_route_remove_all = FALSE;
+	memset (&default_route, 0, sizeof (default_route));
+	default_route.rt_source = NM_IP_CONFIG_SOURCE_USER;
+	default_route.gateway = *gateway;
+	default_route.metric = route_metric_with_penalty (self,
+	                                       nm_device_get_ip6_route_metric (self));
+	default_route.mss = nm_ip6_config_get_mss (composite);
+	nm_clear_nmp_object (&priv->default_route6);
+	nm_ip6_config_add_route (composite, &default_route, &priv->default_route6);
 
-	has_direct_route = nm_ip6_config_get_direct_route_for_host (composite, gateway) != NULL;
-
-
-
-	priv->default_route.v6_has = TRUE;
-	memset (&priv->default_route.v6, 0, sizeof (priv->default_route.v6));
-	priv->default_route.v6.rt_source = NM_IP_CONFIG_SOURCE_USER;
-	priv->default_route.v6.gateway = *gateway;
-	priv->default_route.v6.metric = route_metric_with_penalty (self,
-	                                                           nm_device_get_ip6_route_metric (self));
-	priv->default_route.v6.mss = nm_ip6_config_get_mss (composite);
-
-	if (!has_direct_route) {
-		NMPlatformIP6Route r = priv->default_route.v6;
-
+	if (!nm_ip6_config_get_direct_route_for_host (composite, gateway)) {
 		/* add a direct route to the gateway */
-		r.network = *gateway;
-		r.plen = 128;
-		r.gateway = in6addr_any;
-		nm_ip6_config_add_route (composite, &r, NULL);
+		default_route.network = *gateway;
+		default_route.plen = 128;
+		default_route.gateway = in6addr_any;
+		nm_clear_nmp_object (&priv->default_routegw6);
+		nm_ip6_config_add_route (composite, &default_route, &priv->default_routegw6);
 	}
 
 END_ADD_DEFAULT_ROUTE:
-
-	if (priv->default_route.v6_is_assumed) {
-		/* If above does not explicitly assign a default route, we always pick up the
-		 * default route based on what is currently configured.
-		 * That means that even managed connections with never-default, can
-		 * get a default route (if configured externally).
-		 */
-		priv->default_route.v6_has = _device_get_default_route_from_platform (self, AF_INET6, (NMPlatformIPRoute *) &priv->default_route.v6);
-	}
+	if (default_route_remove_all)
+		nm_ip6_config_default_routes_remove_all (composite);
 
 	/* Allow setting MTU etc */
 	if (commit) {
@@ -8900,6 +8742,8 @@ _cleanup_ip4_pre (NMDevice *self, CleanupType cleanup_type)
 		_LOGD (LOGD_DEVICE, "clearing queued IP4 config change");
 	priv->queued_ip4_config_pending = FALSE;
 
+	nm_clear_nmp_object (&priv->default_route4);
+	nm_clear_nmp_object (&priv->default_routegw4);
 	dhcp4_cleanup (self, cleanup_type, FALSE);
 	arp_cleanup (self);
 	dnsmasq_cleanup (self);
@@ -8917,6 +8761,8 @@ _cleanup_ip6_pre (NMDevice *self, CleanupType cleanup_type)
 		_LOGD (LOGD_DEVICE, "clearing queued IP6 config change");
 	priv->queued_ip6_config_pending = FALSE;
 
+	nm_clear_nmp_object (&priv->default_route6);
+	nm_clear_nmp_object (&priv->default_routegw6);
 	g_clear_object (&priv->dad6_ip6_config);
 	dhcp6_cleanup (self, cleanup_type, FALSE);
 	linklocal6_cleanup (self);
@@ -9873,7 +9719,6 @@ nm_device_set_ip4_config (NMDevice *self,
 	NMIP4Config *old_config = NULL;
 	gboolean has_changes = FALSE;
 	gboolean success = TRUE;
-	gboolean def_route_changed;
 	int ip_ifindex = 0;
 
 	g_return_val_if_fail (NM_IS_DEVICE (self), FALSE);
@@ -9926,7 +9771,6 @@ nm_device_set_ip4_config (NMDevice *self,
 		g_clear_object (&priv->dev_ip4_config);
 	}
 
-	def_route_changed = nm_default_route_manager_ip4_update_default_route (nm_netns_get_default_route_manager (priv->netns), self);
 	concheck_periodic_update (self);
 
 	if (!nm_device_sys_iface_state_is_external_or_assume (self))
@@ -9960,9 +9804,6 @@ nm_device_set_ip4_config (NMDevice *self,
 		}
 
 		nm_device_queue_recheck_assume (self);
-	} else if (def_route_changed) {
-		_LOGD (LOGD_IP4, "ip4-config: default route changed");
-		g_signal_emit (self, signals[IP4_CONFIG_CHANGED], 0, priv->ip4_config, priv->ip4_config);
 	}
 
 	return success;
@@ -10040,7 +9881,6 @@ nm_device_set_ip6_config (NMDevice *self,
 	NMIP6Config *old_config = NULL;
 	gboolean has_changes = FALSE;
 	gboolean success = TRUE;
-	gboolean def_route_changed;
 	int ip_ifindex = 0;
 
 	g_return_val_if_fail (NM_IS_DEVICE (self), FALSE);
@@ -10091,8 +9931,6 @@ nm_device_set_ip6_config (NMDevice *self,
 		       nm_exported_object_get_path (NM_EXPORTED_OBJECT (old_config)));
 	}
 
-	def_route_changed = nm_default_route_manager_ip6_update_default_route (nm_netns_get_default_route_manager (priv->netns), self);
-
 	if (has_changes) {
 		NMSettingsConnection *settings_connection;
 
@@ -10122,9 +9960,6 @@ nm_device_set_ip6_config (NMDevice *self,
 
 		if (priv->ndisc)
 			ndisc_set_router_config (priv->ndisc, self);
-	} else if (def_route_changed) {
-		_LOGD (LOGD_IP6, "ip6-config: default route changed");
-		g_signal_emit (self, signals[IP6_CONFIG_CHANGED], 0, priv->ip6_config, priv->ip6_config);
 	}
 
 	return success;
@@ -10769,6 +10604,12 @@ update_ip4_config (NMDevice *self, gboolean initial)
 			nm_ip4_config_intersect (priv->wwan_ip4_config, priv->ext_ip4_config);
 		for (iter = priv->vpn4_configs; iter; iter = iter->next)
 			nm_ip4_config_intersect (iter->data, priv->ext_ip4_config);
+		if (   priv->default_route4
+		    && !nm_ip4_config_nmpobj_lookup (priv->ext_ip4_config, priv->default_route4))
+			nm_clear_nmp_object (&priv->default_route4);
+		if (   priv->default_routegw4
+		    && !nm_ip4_config_nmpobj_lookup (priv->ext_ip4_config, priv->default_routegw4))
+			nm_clear_nmp_object (&priv->default_routegw4);
 
 		/* Remove parts from ext_ip4_config to only contain the information that
 		 * was configured externally -- we already have the same configuration from
@@ -10781,6 +10622,10 @@ update_ip4_config (NMDevice *self, gboolean initial)
 			nm_ip4_config_subtract (priv->ext_ip4_config, priv->wwan_ip4_config);
 		for (iter = priv->vpn4_configs; iter; iter = iter->next)
 			nm_ip4_config_subtract (priv->ext_ip4_config, iter->data);
+		if (priv->default_route4)
+			nm_ip4_config_nmpobj_remove (priv->ext_ip4_config, priv->default_route4);
+		if (priv->default_routegw4)
+			nm_ip4_config_nmpobj_remove (priv->ext_ip4_config, priv->default_routegw4);
 
 		ip4_config_merge_and_apply (self, NULL, FALSE);
 	}
@@ -10841,6 +10686,12 @@ update_ip6_config (NMDevice *self, gboolean initial)
 			nm_ip6_config_intersect (priv->wwan_ip6_config, priv->ext_ip6_config);
 		for (iter = priv->vpn6_configs; iter; iter = iter->next)
 			nm_ip6_config_intersect (iter->data, priv->ext_ip6_config);
+		if (   priv->default_route6
+		    && !nm_ip6_config_nmpobj_lookup (priv->ext_ip6_config, priv->default_route6))
+			nm_clear_nmp_object (&priv->default_route6);
+		if (   priv->default_routegw6
+		    && !nm_ip6_config_nmpobj_lookup (priv->ext_ip6_config, priv->default_routegw6))
+			nm_clear_nmp_object (&priv->default_routegw6);
 
 		/* Remove parts from ext_ip6_config to only contain the information that
 		 * was configured externally -- we already have the same configuration from
@@ -10855,6 +10706,10 @@ update_ip6_config (NMDevice *self, gboolean initial)
 			nm_ip6_config_subtract (priv->ext_ip6_config, priv->wwan_ip6_config);
 		for (iter = priv->vpn6_configs; iter; iter = iter->next)
 			nm_ip6_config_subtract (priv->ext_ip6_config, iter->data);
+		if (priv->default_route6)
+			nm_ip6_config_nmpobj_remove (priv->ext_ip6_config, priv->default_route6);
+		if (priv->default_routegw6)
+			nm_ip6_config_nmpobj_remove (priv->ext_ip6_config, priv->default_routegw6);
 
 		ip6_config_merge_and_apply (self, FALSE);
 	}
@@ -12089,16 +11944,6 @@ _cleanup_generic_post (NMDevice *self, CleanupType cleanup_type)
 {
 	NMDevicePrivate *priv = NM_DEVICE_GET_PRIVATE (self);
 
-	if (cleanup_type == CLEANUP_TYPE_DECONFIGURE) {
-		_update_default_route (self, AF_INET,  FALSE, FALSE);
-		_update_default_route (self, AF_INET6, FALSE, FALSE);
-	} else {
-		_update_default_route (self, AF_INET,  priv->default_route.v4_has, TRUE);
-		_update_default_route (self, AF_INET6, priv->default_route.v6_has, TRUE);
-	}
-	_update_default_route (self, AF_INET,  FALSE, TRUE);
-	_update_default_route (self, AF_INET6, FALSE, TRUE);
-
 	priv->v4_commit_first_time = TRUE;
 	priv->v6_commit_first_time = TRUE;
 
@@ -12109,6 +11954,10 @@ _cleanup_generic_post (NMDevice *self, CleanupType cleanup_type)
 	 */
 	nm_device_set_ip4_config (self, NULL, 0, TRUE);
 	nm_device_set_ip6_config (self, NULL, TRUE);
+	nm_clear_nmp_object (&priv->default_route4);
+	nm_clear_nmp_object (&priv->default_route6);
+	nm_clear_nmp_object (&priv->default_routegw4);
+	nm_clear_nmp_object (&priv->default_routegw6);
 	g_clear_object (&priv->proxy_config);
 	g_clear_object (&priv->con_ip4_config);
 	g_clear_object (&priv->dev_ip4_config);
@@ -13787,9 +13636,6 @@ nm_device_init (NMDevice *self)
 	priv->available_connections = g_hash_table_new_full (g_direct_hash, g_direct_equal, g_object_unref, NULL);
 	priv->ip6_saved_properties = g_hash_table_new_full (g_str_hash, g_str_equal, NULL, g_free);
 	priv->sys_iface_state = NM_DEVICE_SYS_IFACE_STATE_EXTERNAL;
-
-	priv->default_route.v4_is_assumed = TRUE;
-	priv->default_route.v6_is_assumed = TRUE;
 
 	priv->v4_commit_first_time = TRUE;
 	priv->v6_commit_first_time = TRUE;

@@ -44,7 +44,6 @@
 #include "settings/nm-agent-manager.h"
 #include "nm-core-internal.h"
 #include "nm-pacrunner-manager.h"
-#include "nm-default-route-manager.h"
 #include "nm-firewall-manager.h"
 #include "nm-config.h"
 #include "nm-vpn-plugin-info.h"
@@ -497,9 +496,6 @@ _set_vpn_state (NMVpnConnection *self,
 	cancel_get_secrets (self);
 
 	dispatcher_cleanup (self);
-
-	nm_default_route_manager_ip4_update_default_route (nm_netns_get_default_route_manager (priv->netns), self);
-	nm_default_route_manager_ip6_update_default_route (nm_netns_get_default_route_manager (priv->netns), self);
 
 	/* The connection gets destroyed by the VPN manager when it enters the
 	 * disconnected/failed state, but we need to keep it around for a bit
@@ -1168,9 +1164,6 @@ nm_vpn_connection_apply_config (NMVpnConnection *self)
 
 	apply_parent_device_config (self);
 
-	nm_default_route_manager_ip4_update_default_route (nm_netns_get_default_route_manager (priv->netns), self);
-	nm_default_route_manager_ip6_update_default_route (nm_netns_get_default_route_manager (priv->netns), self);
-
 	_LOGI ("VPN connection: (IP Config Get) complete");
 	if (priv->vpn_state < STATE_PRE_UP)
 		_set_vpn_state (self, STATE_PRE_UP, NM_ACTIVE_CONNECTION_STATE_REASON_NONE, FALSE);
@@ -1597,6 +1590,18 @@ nm_vpn_connection_ip4_config_get (NMVpnConnection *self, GVariant *dict)
 	                             nm_connection_get_setting_ip4_config (_get_applied_connection (self)),
 	                             route_metric);
 
+	if (!nm_ip4_config_get_never_default (config)) {
+		const NMPlatformIP4Route r = {
+			.ifindex   = ip_ifindex,
+			.rt_source = NM_IP_CONFIG_SOURCE_VPN,
+			.gateway   = nm_ip4_config_get_gateway (config),
+			.metric    = route_metric,
+			.mss       = nm_ip4_config_get_mss (config),
+		};
+
+		nm_ip4_config_add_route (config, &r, NULL);
+	}
+
 	if (priv->ip4_config) {
 		nm_ip4_config_replace (priv->ip4_config, config, NULL);
 		g_object_unref (config);
@@ -1758,6 +1763,18 @@ next:
 	nm_ip6_config_merge_setting (config,
 	                             nm_connection_get_setting_ip6_config (_get_applied_connection (self)),
 	                             route_metric);
+
+	if (!nm_ip6_config_get_never_default (config)) {
+		const NMPlatformIP6Route r = {
+			.ifindex   = ip_ifindex,
+			.rt_source = NM_IP_CONFIG_SOURCE_VPN,
+			.gateway   = *(nm_ip6_config_get_gateway (config) ?: &in6addr_any),
+			.metric    = route_metric,
+			.mss       = nm_ip6_config_get_mss (config),
+		};
+
+		nm_ip6_config_add_route (config, &r, NULL);
+	}
 
 	if (priv->ip6_config) {
 		nm_ip6_config_replace (priv->ip6_config, config, NULL);
