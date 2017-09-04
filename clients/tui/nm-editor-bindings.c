@@ -73,40 +73,53 @@ nm_editor_bindings_init (void)
 static gboolean
 parse_addr_prefix (const char  *text,
                    int          family,
-                   char       **addr,
-                   guint32     *prefix)
+                   char       **out_addr,
+                   guint32     *out_prefix)
 {
+	gs_free char *addrstr_free = NULL;
+	guint32 prefix;
 	const char *slash;
-	char *addrstr, *end;
-	gboolean valid;
+	const char *addrstr;
+	union {
+		in_addr_t v4;
+		struct in6_addr v6;
+	} addrbin;
+	char addrstr_buf[NM_UTILS_INET_ADDRSTRLEN];
+
+	g_return_val_if_fail (text, FALSE);
+
+	if (family == AF_UNSPEC)
+		family = strchr (text, ':') ? AF_INET6 : AF_INET;
+	else
+		g_return_val_if_fail (NM_IN_SET (family, AF_INET, AF_INET6), FALSE);
 
 	slash = strchr (text, '/');
-
 	if (slash)
-		addrstr = g_strndup (text, slash - text);
+		addrstr = addrstr_free = g_strndup (text, slash - text);
 	else
-		addrstr = g_strdup (text);
-	valid = nm_utils_ipaddr_valid (family, addrstr);
+		addrstr = text;
+
+	if (inet_pton (family, addrstr, &addrbin) != 1)
+		return FALSE;
 
 	if (slash) {
-		*prefix = strtoul (slash + 1, &end, 10);
-		if (   *end
-		    || *prefix == 0
-		    || (family == AF_INET && *prefix > 32)
-		    || (family == AF_INET6 && *prefix > 128))
-			valid = FALSE;
-	} else if (prefix) {
+		prefix = _nm_utils_ascii_str_to_int64 (slash + 1, 10,
+		                                       0,
+		                                       family == AF_INET ? 32 : 128,
+		                                       G_MAXUINT32);
+		if (prefix == G_MAXUINT32)
+			return FALSE;
+	} else if (out_prefix) {
 		if (family == AF_INET)
-			*prefix = 32;
+			prefix = nm_utils_ip4_get_default_prefix (addrbin.v4);
 		else
-			*prefix = 128;
-	}
+			prefix = 128;
+	} else
+		prefix = 0;
 
-	if (addr && valid)
-		*addr = addrstr;
-	else
-		g_free (addrstr);
-	return valid;
+	NM_SET_OUT (out_addr, g_strdup (inet_ntop (family, &addrbin, addrstr_buf, sizeof (addrstr_buf))));
+	NM_SET_OUT (out_prefix, prefix);
+	return TRUE;
 }
 
 static gboolean
